@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PriceSync — Marketplace Upload Converter</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #060c18; font-family: 'DM Sans', 'Segoe UI', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+    input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(0.5); cursor: pointer; }
+    code { font-family: monospace; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useRef } = React;
+
+
+// ─── Utils ───────────────────────────────────────────────────────────────────
+
+const norm = (h) => String(h || "").toLowerCase().replace(/[\s\n\r]+/g, " ").trim();
+
+function parsePrice(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw === "number") return isFinite(raw) && raw > 0 ? raw : null;
+  const s = String(raw).trim().replace(/\s/g, "");
+  if (!s || s === "-") return null;
+  const decComma  = /^[\d.]+,\d{1,2}$/.test(s);
+  const decPeriod = /^[\d,]+\.\d{1,2}$/.test(s);
+  let cleaned;
+  if (decComma)       cleaned = s.replace(/\./g, "").replace(",", ".");
+  else if (decPeriod) cleaned = s.replace(/,/g, "");
+  else                cleaned = s.replace(/[,.]/g, "");
+  const n = parseFloat(cleaned);
+  return isFinite(n) && n > 0 ? n : null;
+}
+
+const fmtIDR = (n) => n != null ? Number(n).toLocaleString("id-ID") : "—";
+
+// Column index → Excel letter (A, B, ... Z, AA, AB...)
+function colLetter(idx) {
+  let s = "";
+  let n = idx;
+  do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+  return s;
+}
+
+function roundUp(value) {
+  // Mirrors Excel =ROUNDUP(value, 0) — ceiling to nearest whole number
+  return Math.ceil(value);
+}
+
+// ─── Parse Shopee Inventory ───────────────────────────────────────────────────
+// Row 3 = headers (Product ID, Product Name, Variation ID, Variation Name,
+//                  Parent SKU, SKU [col F], Price, GTIN, Stock [col I] ...)
+// Data starts when col A (Product ID) is a long numeric string
+
+function parseInventory(buffer) {
+  const wb   = XLSX.read(buffer, { type: "array" });
+  const ws   = wb.Sheets[wb.SheetNames[0]];
+  const raw  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  // Find header row: has "SKU" AND "Stock" AND "Product ID"
+  const hIdx = raw.findIndex(row => {
+    const ns = row.map(c => norm(c));
+    return ns.includes("sku") && ns.includes("stock") && ns.some(c => c.includes("product id"));
+  });
+  if (hIdx === -1) return { error: "Cannot find headers (SKU/Stock/Product ID) in inventory file." };
+
+  const headers = raw[hIdx];
+  const ci = (kws, excl = []) => headers.findIndex(h => {
+    const n = norm(h);
+    return kws.every(k => n.includes(k)) && !excl.some(e => n.includes(e));
+  });
+
+  const colMap = {
+    productId:   ci(["product id"]),
+    productName: ci(["product name"]),
+    variationId: ci(["variation id"]),
+    varName:     ci(["variation name"]),
+    parentSku:   ci(["parent sku"]),
+    sku:         ci(["sku"], ["parent"]),  // col F — THE JOIN KEY
+    price:       ci(["price"], ["gtin"]),
+    stock:       ci(["stock"]),
+  };
+
+  // Data rows: first col is a long numeric product ID
+  const rows = raw.slice(hIdx + 1).filter(row => {
+    const pid = String(row[colMap.productId] || "").trim();
+    return /^\d{6,}$/.test(pid);
+  });
+
+  return { colMap, rows, totalRows: rows.length, headers };
+}
+
+function parseTikTokInventory(buffer) {
+  const wb = XLSX.read(buffer, { type: "array" });
+  const ws = wb.Sheets.Template || wb.Sheets[wb.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  const hIdx = raw.findIndex(row => {
+    const ns = row.map(c => norm(c));
+    return ns.includes("product_id") && ns.includes("sku_id") && ns.includes("seller_sku");
+  });
+  if (hIdx === -1) return { error: "Cannot find TikTok Template headers (product_id/sku_id/seller_sku)." };
+
+  const headers = raw[hIdx];
+  const ci = (kws) => headers.findIndex(h => {
+    const n = norm(h);
+    return kws.some(k => n === k || n.includes(k));
+  });
+
+  const colMap = {
+    productId:   ci(["product_id"]),
+    productName: ci(["product_name"]),
+    variationId: ci(["sku_id"]),
+    varName:     ci(["variation_value"]),
+    parentSku:   -1,
+    sku:         ci(["seller_sku"]),
+    price:       ci(["price"]),
+    stock:       ci(["quantity"]),
+  };
+
+  if (colMap.productId === -1 || colMap.variationId === -1 || colMap.sku === -1) {
+    return { error: "TikTok inventory is missing Product ID, SKU ID, or SKU Penjual/seller_sku." };
+  }
+
+  const rows = raw.slice(hIdx + 1).filter(row => {
+    const pid = String(row[colMap.productId] || "").trim();
+    const sku = String(row[colMap.sku] || "").trim();
+    return pid && sku && /^\d{6,}$/.test(pid);
+  });
+
+  return { colMap, rows, totalRows: rows.length, headers };
+}
+
+
+function parseLazadaInventory(buffer) {
+  const wb = XLSX.read(buffer, { type: "array" });
+  const ws = wb.Sheets["template"] || wb.Sheets[wb.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  // Row 1 (idx 0) = column headers; rows 2-4 = description rows; row 5+ = data
+  const headers = raw[0];
+  const ci = (kws, excl=[]) => headers.findIndex(h => {
+    const n = norm(h);
+    return kws.some(k => n.includes(k)) && !excl.some(e => n.includes(e));
+  });
+  const colMap = {
+    productId:   ci(["product id"]),
+    productName: ci(["nama produk"]),
+    variationId: ci(["sku.skuid"]),
+    varName:     ci(["variations combo"]),
+    parentSku:   -1,
+    sku:         ci(["seller sku"]),   // JOIN KEY — matches memo Item Code
+    price:       ci(["harga"]),        // current marketplace price (RRP)
+    stock:       ci(["jumlah stok"]),
+    lazadaSku:   ci(["sku lazada"]),
+  };
+  if (colMap.sku === -1) return { error: "Cannot find 'Seller SKU' column in Lazada inventory. Expected headers in row 1." };
+  // Data starts at index 4 (row 5) — rows 2-4 are description rows
+  const rows = raw.slice(4).filter(row => String(row[colMap.sku] || "").trim().length > 0);
+  return { colMap, rows, totalRows: rows.length, headers };
+}
+// ─── Parse Memo Pricelist ─────────────────────────────────────────────────────
+// Row 1 = event category labels
+// Row 2 = column headers (Product ID, Status Product, Item Number [col C],
+//                         Season, Item Description, Original Price,
+//                         Current Price, [promo cols]...)
+// Row 3+ = data (Item Number in col C)
+
+// Returns all sheet names + first valid sheet pre-parsed for fast sheet switching
+function getMemoSheets(buffer) {
+  const wb = XLSX.read(buffer, { type: "array" });
+  return wb.SheetNames;
+}
+
+function parseMemo(buffer, sheetName) {
+  const wb   = XLSX.read(buffer, { type: "array" });
+
+  // If no sheetName given, auto-pick the first month-like sheet
+  const resolved = sheetName
+    || wb.SheetNames.find(n => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|june|may)/i.test(n))
+    || wb.SheetNames[0];
+
+  const ws   = wb.Sheets[resolved];
+  if (!ws) return { error: `Sheet "${resolved}" not found.` };
+  const raw  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+
+  // Find header row: contains "item number" or "item code" AND "original price"
+  const hIdx = raw.findIndex(row => {
+    const ns = row.map(c => norm(c));
+    return (ns.some(c => c.includes("item number") || c.includes("item code")))
+        && ns.some(c => c.includes("original price"));
+  });
+  if (hIdx === -1) return { error: `Cannot find 'Item Code' + 'Original Price' headers in sheet "${resolved}".` };
+
+  const headers   = raw[hIdx];
+  const labelRow  = hIdx > 0 ? raw[hIdx - 1] : [];
+
+  const itemCodeCol    = headers.findIndex(h => norm(h).includes("item number") || norm(h).includes("item code"));
+  const origPriceCol   = headers.findIndex(h => norm(h).includes("original price"));
+  const currentPriceCol= headers.findIndex(h => norm(h).includes("current price"));
+
+  const dataRows = raw.slice(hIdx + 1).filter(r => r[itemCodeCol] && String(r[itemCodeCol]).trim() !== "");
+
+  // ── Promo price columns (numeric avg > 1000 IDR) ──
+  const SKIP = ["original price","current price","disc","markup","markdown","qty","wms","product id","status","item","season","brand","desc","reason","gtin","minimum","maximum","purchase","fail","date","shopee","lazada","zalora","tokopedia","dotcom","tbc","free","shipping","voucher","flexi","bundle","follower","replenish","remarks","flash","bmo","cbmo","periode","yes","no","periode"];
+  const promoCols = [];
+  headers.forEach((h, idx) => {
+    const n = norm(h);
+    if (!n || SKIP.some(s => n.includes(s))) return;
+    if (idx === itemCodeCol || idx === origPriceCol || idx === currentPriceCol) return;
+    const vals = dataRows.slice(0, 20).map(r => typeof r[idx]==="number" ? r[idx] : parsePrice(r[idx])).filter(v=>v!=null);
+    if (!vals.length) return;
+    const avg = vals.reduce((a,b)=>a+b,0)/vals.length;
+    if (avg < 1000) return;
+    const letter = colLetter(idx);
+    const rawLabel = String(h||"").replace(/\n/g," ").trim();
+    const categoryLabel = String(labelRow[idx]||"").replace(/\n/g," ").trim();
+    promoCols.push({ colIndex:idx, colLetter:letter, headerLabel:rawLabel, categoryLabel,
+      displayLabel:`Col ${letter}  —  ${rawLabel}${categoryLabel&&categoryLabel!==rawLabel?" ("+categoryLabel.split("(")[0].trim()+")":""}` });
+  });
+
+  // ── Period columns (YES/NO columns from col M onwards, for LIVE sheets) ──
+  // Identified by: col index >= 12, header contains "date" or "yes/no", data has YES/NO values
+  const periodCols = [];
+  headers.forEach((h, idx) => {
+    if (idx < 12) return; // only from col M onwards
+    const hn = norm(h);
+    if (!hn) return;
+    // Must look like a period column: has date/yes/no in header
+    if (!hn.includes("date") && !hn.includes("yes/no") && !hn.includes("yes") && !hn.includes("periode")) return;
+    // Confirm data rows have YES/NO values
+    const sample = dataRows.slice(0, 30).map(r => String(r[idx]||"").toLowerCase().trim());
+    const hasYesNo = sample.some(v => v === "yes" || v === "no");
+    if (!hasYesNo) return;
+
+    const letter = colLetter(idx);
+    const rawH   = String(h||"").trim();
+    // Try to extract a clean date label from "DATE : 3 - 5 June 26\nSHOPEE TIME : 13.00 - 15.00\n(YES/NO)"
+    const dateMatch = rawH.match(/DATE\s*:\s*([^\n(]+)/i);
+    const timeMatch = rawH.match(/TIME\s*:\s*([^\n(]+)/i);
+    const dateStr   = dateMatch ? dateMatch[1].trim() : "";
+    const timeStr   = timeMatch ? timeMatch[1].trim() : "";
+    const shortLabel = dateStr
+      ? `${dateStr}${timeStr ? " · " + timeStr : ""}`
+      : `Period ${letter} (date TBD)`;
+
+    const included = sample.filter(v=>v==="yes").length;
+    periodCols.push({ colIndex:idx, colLetter:letter, shortLabel, rawHeader:rawH,
+      displayLabel:`Col ${letter} — ${shortLabel}`, includedCount:included });
+  });
+
+  // Build lookup: itemCode → row
+  const lookup = new Map();
+  dataRows.forEach(row => {
+    const code = String(row[itemCodeCol]||"").trim();
+    if (code) lookup.set(code, row);
+  });
+
+  return {
+    colMap: { itemCode: itemCodeCol, originalPrice: origPriceCol, currentPrice: currentPriceCol },
+    lookup, promoCols, periodCols, totalRows: lookup.size,
+    sheetName: resolved, isLiveSheet: periodCols.length > 0,
+  };
+}
+
+// ─── Merge Logic ──────────────────────────────────────────────────────────────
+
+function mergeData(inventory, memo, selectedPromoCol, selPeriodCol = null) {
+  const { colMap: inv, rows } = inventory;
+  const { colMap: mem, lookup } = memo;
+
+  return rows.map(row => {
+    const productId   = String(row[inv.productId]   || "").trim();
+    const productName = String(row[inv.productName] || "").trim();
+    const variationId = String(row[inv.variationId] || "").trim();
+    const varName     = String(row[inv.varName]     || "").trim();
+    const parentSku   = String(row[inv.parentSku]   || "").trim();
+    const sku         = String(row[inv.sku]         || "").trim();
+    const invPrice    = typeof row[inv.price] === "number" ? row[inv.price] : parsePrice(row[inv.price]);
+    const stock       = typeof row[inv.stock] === "number" ? row[inv.stock] : parseInt(String(row[inv.stock] || "0").replace(/\D/g, ""), 10) || 0;
+
+    const memoRow    = lookup.get(sku);
+    const rawDisc    = memoRow ? parsePrice(memoRow[selectedPromoCol.colIndex]) : null;
+    const disc       = rawDisc != null ? roundUp(rawDisc) : null;
+    const wasRounded = rawDisc != null && disc !== rawDisc;
+
+    // RRP: memo col F (originalPrice) vs inventory col G (price)
+    const memoRRP     = memoRow && mem.originalPrice !== -1 ? parsePrice(memoRow[mem.originalPrice]) : null;
+    const rrpMismatch = memoRRP != null && invPrice != null && memoRRP !== invPrice;
+    const rrpDiff     = rrpMismatch ? invPrice - memoRRP : 0;
+
+    // Period filter (LIVE sheets): check selected period column for YES/NO
+    const periodVal       = selPeriodCol && memoRow ? String(memoRow[selPeriodCol.colIndex]||"").toLowerCase().trim() : null;
+    const excludedByPeriod = selPeriodCol != null && memoRow != null && periodVal !== "yes";
+
+    const discPct = (invPrice != null && disc != null && invPrice > 0)
+                    ? Math.round((1 - disc / invPrice) * 100) : null;
+
+    const flags = [];
+    if (stock === 0)                         flags.push({ type:"skip",   msg:"Zero stock" });
+    if (!memoRow)                            flags.push({ type:"error",  msg:"SKU not in memo" });
+    else if (disc == null)                   flags.push({ type:"error",  msg:"Missing price" });
+    else if (discPct != null && discPct < 0) flags.push({ type:"warn",   msg:"Disc > Original" });
+    else if (discPct != null && discPct===0) flags.push({ type:"info",   msg:"No discount" });
+    else if (discPct != null && discPct>80)  flags.push({ type:"warn",   msg:`High disc ${discPct}%` });
+    if (rrpMismatch)                         flags.push({ type:"rrp",    msg:`RRP mismatch ${rrpDiff>0?"+":""}${fmtIDR(rrpDiff)}` });
+    if (excludedByPeriod)                    flags.push({ type:"period", msg:"Not in period" });
+
+    const noPrice     = disc == null;
+    const isZeroStock = stock === 0;
+
+    return { productId, productName, variationId, varName, parentSku, sku,
+             invPrice, memoRRP, rrpMismatch, rrpDiff,
+             rawDisc, disc, wasRounded, discPct, stock,
+             periodVal, excludedByPeriod,
+             flags, noPrice, isZeroStock, memoFound: !!memoRow };
+  });
+}
+
+const isExported = (row, inclZero, exclRRP, exclZeroDisc) =>
+  !row.noPrice &&
+  !row.excludedByPeriod &&           // period filter: always hard-exclude if not YES
+  (inclZero   || !row.isZeroStock) &&
+  (!exclRRP   || !row.rrpMismatch) &&
+  (!exclZeroDisc || row.discPct !== 0);
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+function PriceSync() {
+  const [marketplace, setMarketplace] = useState(null); // null | "shopee" | "tiktok"
+  const [mode, setMode]           = useState(null); // null | "discount" | "live"
+  const [step, setStep]           = useState(1);
+  const [inventory, setInventory] = useState(null);
+  const [invFile, setInvFile]     = useState("");
+  const [memo, setMemo]           = useState(null);
+  const [memoFile, setMemoFile]   = useState("");
+  const [memoBuffer, setMemoBuffer]         = useState(null);
+  const [availableSheets, setAvailSheets]   = useState([]);
+  const [selectedMemoSheet, setSelMemoSheet]= useState(null);
+  const [selPromoCol, setSelPromoCol]       = useState(null);
+  const [selPeriodCol, setSelPeriodCol]     = useState(null);
+  const [merged, setMerged]       = useState([]);
+  const [filterQC, setFilterQC]   = useState("all");
+  const [filterQC4, setFilterQC4] = useState("exported");
+  const [dragOver, setDragOver]   = useState(null);
+  const [inclZero, setInclZero]   = useState(false);
+  const [exclRRP,  setExclRRP]    = useState(false);
+  const [exclZeroDisc, setExclZeroDisc] = useState(false);
+  const [lazadaStartDate, setLazadaStartDate] = useState("");
+  const [lazadaEndDate,   setLazadaEndDate]   = useState("");
+  const invRef  = useRef();
+  const memoRef = useRef();
+
+  const resetAll = () => {
+    setMarketplace(null); setMode(null); setStep(1);
+    setInventory(null); setMemo(null); setInvFile(""); setMemoFile("");
+    setMemoBuffer(null); setAvailSheets([]); setSelMemoSheet(null);
+    setSelPromoCol(null); setSelPeriodCol(null); setMerged([]);
+    setInclZero(false); setExclRRP(false); setExclZeroDisc(false);
+    setLazadaStartDate(""); setLazadaEndDate("");
+  };
+
+  const loadFile = useCallback((file, parser, setter, nameSetter) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const res = parser(e.target.result);
+      if (res.error) { alert("⚠️ " + res.error); return; }
+      setter(res); nameSetter(file.name);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  // Memo loader: mode-aware sheet auto-selection
+  const loadMemo = useCallback((file, currentMode) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const buf  = e.target.result;
+      const sheets = getMemoSheets(buf);
+      // Pick default sheet based on mode
+      const defaultSheet = currentMode === "live"
+        ? sheets.find(n => /live/i.test(n)) || sheets[0]
+        : sheets.find(n => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|june|may)/i.test(n) && !/live/i.test(n))
+          || sheets.find(n => !/live/i.test(n)) || sheets[0];
+      const res = parseMemo(buf, defaultSheet);
+      if (res.error) { alert("⚠️ " + res.error); return; }
+      setMemoBuffer(buf); setAvailSheets(sheets);
+      setSelMemoSheet(defaultSheet); setMemo(res);
+      setMemoFile(file.name); setSelPromoCol(null); setSelPeriodCol(null);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const switchMemoSheet = useCallback((sheetName) => {
+    if (!memoBuffer) return;
+    const res = parseMemo(memoBuffer, sheetName);
+    if (res.error) { alert("⚠️ " + res.error); return; }
+    setSelMemoSheet(sheetName); setMemo(res);
+    setSelPromoCol(null); setSelPeriodCol(null);
+  }, [memoBuffer]);
+
+  const generate = useCallback(() => {
+    if (!inventory || !memo || !selPromoCol) return;
+    if (mode === "live" && !selPeriodCol) return;
+    // For discount mode, never pass period col even if sheet has one
+    setMerged(mergeData(inventory, memo, selPromoCol, mode === "live" ? selPeriodCol : null));
+    setFilterQC("all"); setFilterQC4("exported");
+    setStep(3);
+  }, [inventory, memo, selPromoCol, selPeriodCol, mode]);
+
+  // Upload file: only exported rows, respects export toggles
+  const download = useCallback(() => {
+    const valid = merged.filter(r => isExported(r, inclZero, exclRRP, exclZeroDisc));
+    const isTikTok = marketplace === "tiktok";
+    const isLazada = marketplace === "lazada";
+    let wsData, colWidths;
+    if (isTikTok) {
+      const hdrs = ["Product_id (wajib)", "SKU_id (wajib)", "Harga Penawaran (wajib)"];
+      wsData = [hdrs, ...valid.map(r => [r.productId, r.variationId, r.disc])];
+      colWidths = [24,24,20];
+    } else if (isLazada) {
+      const desc = ["A unique seller code to identify the product.","Displays result as Success or Failure.","Failure reason if any.","Manufacturer suggested price. Numeric.","Reduced price for the promotion. Numeric.","Discount start time. yyyy-MM-dd HH:mm:ss","Discount end time. yyyy-MM-dd HH:mm:ss"];
+      const hdrs  = ["Seller SKU","Marketplace Status","Marketplace Message","RRP","Sale Amount","Sale Start Date(WIB)","Sale End Date(WIB)"];
+      const req   = ["Required","Auto-generated (Don't edit)","Auto-generated (Don't edit)","Required","Required","Conditionally Required","Conditionally Required"];
+      wsData = [desc, hdrs, req, ...valid.map(r => [r.sku, "", "", r.invPrice ?? "", r.disc, lazadaStartDate || "", lazadaEndDate || ""])];
+      colWidths = [22,20,20,16,16,24,24];
+    } else {
+      const hdrs = ["Product ID","Product Name(Optional)","Parent SKU. Ref. No.(Optional)","Variation ID","Variation name(Optional)","SKU Ref. No.(Optional)","Original price (Optional)","Discount price","Purchase Limit (Optional)"];
+      wsData = [hdrs, ...valid.map(r => [r.productId, r.productName, r.parentSku, r.variationId, r.varName, r.sku, r.invPrice ?? "", r.disc, ""])];
+      colWidths = [14,32,18,14,22,14,18,14,16];
+    }
+    const ws = XLSX.utils.aoa_to_sheet(wsData);
+    ws["!cols"] = colWidths.map(w => ({ wch: w }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Upload");
+    const prefix = isTikTok ? "TikTok" : isLazada ? "Lazada" : "Shopee";
+    const modePrefix = mode === "live" ? "Live" : "Discount";
+    XLSX.writeFile(wb, `${prefix}_${modePrefix}_${selPromoCol.headerLabel.replace(/[\s\/\\:*?"<>|]+/g, "_")}_Upload.xlsx`);
+  }, [merged, selPromoCol, inclZero, exclRRP, exclZeroDisc, marketplace, mode, lazadaStartDate, lazadaEndDate]);
+
+  const downloadWorkingFile = useCallback(() => {
+    const hdrs = [
+      "SKU (Join Key)", "Product ID", "Product Name", "Variation ID", "Variation Name",
+      "Stock",
+      "RRP — Memo (Col F)",           // col G: memo original price
+      "Price — Marketplace (Col G)",  // col H: inventory current price
+      "RRP Match?",                   // col I
+      "RRP Diff (MP − RRP)",          // col J
+      "Live Period",                  // col K: period column header (LIVE sheets only)
+      "In Period? (YES/NO)",          // col L
+      "Raw Disc Price (from Memo)",   // col M
+      "Disc Price [=ROUNDUP(M,0)]",   // col N: formula
+      "Disc %",
+      "Exported?",
+      "Status / Notes",
+    ];
+    const dataRows = merged.map((r, i) => {
+      const excelRow  = i + 2;
+      const exported  = isExported(r, inclZero, exclRRP, exclZeroDisc);
+      const statusParts = [];
+      if (r.isZeroStock)  statusParts.push("Zero stock");
+      if (!r.memoFound)   statusParts.push("SKU not in memo");
+      if (r.rawDisc == null && r.memoFound) statusParts.push("Missing price in memo");
+      if (r.discPct === 0) statusParts.push("0% discount");
+      if (r.rrpMismatch)  statusParts.push(`RRP mismatch (diff ${r.rrpDiff > 0 ? "+" : ""}${fmtIDR(r.rrpDiff)})`);
+      if (r.excludedByPeriod) statusParts.push("Not in live period");
+      if (r.flags.some(f => f.type === "warn" && f.type !== "rrp")) statusParts.push(r.flags.find(f=>f.type==="warn").msg);
+      if (statusParts.length === 0) statusParts.push("OK");
+      // col M = raw disc (index 12, Excel col M), ROUNDUP formula → col N
+      return [
+        r.sku, r.productId, r.productName, r.variationId, r.varName,
+        r.stock,
+        r.memoRRP  ?? "",
+        r.invPrice ?? "",
+        r.memoRRP != null && r.invPrice != null ? (r.rrpMismatch ? "MISMATCH" : "MATCH") : "",
+        r.rrpMismatch ? r.rrpDiff : "",
+        selPeriodCol ? selPeriodCol.shortLabel : "N/A",    // col K: period name
+        selPeriodCol ? (r.periodVal === "yes" ? "YES" : (r.periodVal || "NO")) : "N/A",  // col L
+        r.rawDisc  ?? "",                                  // col M
+        r.rawDisc  != null ? { f: `ROUNDUP(M${excelRow},0)`, v: r.disc } : "",  // col N
+        r.discPct  != null ? `${r.discPct}%` : "",
+        exported ? "YES" : "NO",
+        statusParts.join(" · "),
+      ];
+    });
+    const ws = XLSX.utils.aoa_to_sheet([hdrs, ...dataRows]);
+    ws["!cols"] = [16,14,32,12,20,6,18,18,10,12,22,10,18,18,8,10,30].map(w=>({wch:w}));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Working File");
+    const legendData = [
+      ["PriceSync Working File — Audit Sheet"], [""],
+      ["Column", "Description"],
+      ["SKU",                    "Join key — matched against Memo 'Item Number'"],
+      ["RRP — Memo (Col P)",     `Memo Original Price: Col ${selPromoCol?.colLetter} mapped to memo originalPrice`],
+      ["Price — Marketplace (G)","Current price in Shopee inventory (col G of inventory report)"],
+      ["RRP Match?",             "MATCH = memo RRP equals marketplace price. MISMATCH = they differ."],
+      ["RRP Diff (MP − RRP)",    "Positive = marketplace is priced higher than client RRP. Negative = lower."],
+      ["Raw Disc Price (Memo)",  `From memo col ${selPromoCol?.colLetter} — ${selPromoCol?.headerLabel}`],
+      ["Disc Price [=ROUNDUP]",  "=ROUNDUP(Raw Disc Price, 0) — mirrors Excel ROUNDUP(K,0)"],
+      ["Exported?",              `YES/NO — Zero stock: ${inclZero?"INCLUDED":"EXCLUDED"} · RRP mismatch: ${exclRRP?"EXCLUDED":"INCLUDED"} · 0% discount: ${exclZeroDisc?"EXCLUDED":"INCLUDED"}`],
+      [""],
+      ["Promo Column",           `Col ${selPromoCol?.colLetter} — ${selPromoCol?.headerLabel}`],
+      ["Zero-stock",             inclZero ? "INCLUDED in export" : "EXCLUDED from export"],
+      ["RRP Mismatch",           exclRRP  ? "EXCLUDED from export" : "INCLUDED in export (flagged only)"],
+      ["0% Discount",            exclZeroDisc ? "EXCLUDED from export" : "INCLUDED in export (flagged only)"],
+    ];
+    const wsL = XLSX.utils.aoa_to_sheet(legendData);
+    wsL["!cols"] = [{wch:30},{wch:65}];
+    XLSX.utils.book_append_sheet(wb, wsL, "Legend");
+    XLSX.writeFile(wb, `WorkingFile_${selPromoCol?.headerLabel.replace(/[\s\/\\:*?"<>|]+/g, "_")}.xlsx`);
+  }, [merged, selPromoCol, inclZero, exclRRP, exclZeroDisc]);
+  const stats = merged.length ? {
+    total:        merged.length,
+    exported:     merged.filter(r => isExported(r, inclZero, exclRRP, exclZeroDisc)).length,
+    zeroStock:    merged.filter(r => r.isZeroStock).length,
+    unmatched:    merged.filter(r => !r.memoFound).length,
+    rrpMismatch:  merged.filter(r => r.rrpMismatch).length,
+    zeroDiscount: merged.filter(r => r.discPct === 0).length,
+    notInPeriod:  merged.filter(r => r.excludedByPeriod).length,
+    warnings:     merged.filter(r => r.flags.some(f => f.type === "warn" || f.type === "rrp")).length,
+    rounded:      merged.filter(r => r.wasRounded).length,
+    errors:       merged.filter(r => r.flags.some(f => f.type === "error")).length,
+  } : null;
+
+  const filtered = merged.filter(r => {
+    if (filterQC === "export")      return isExported(r, inclZero, exclRRP, exclZeroDisc);
+    if (filterQC === "zerostock")   return r.isZeroStock;
+    if (filterQC === "unmatched")   return !r.memoFound;
+    if (filterQC === "rrpmismatch") return r.rrpMismatch;
+    if (filterQC === "zerodiscount") return r.discPct === 0;
+    if (filterQC === "notinperiod") return r.excludedByPeriod;
+    if (filterQC === "warnings")    return r.flags.some(f => f.type === "warn" || f.type === "rrp");
+    if (filterQC === "errors")      return r.flags.some(f => f.type === "error");
+    return true;
+  });
+
+  const canConfigure = inventory && memo;
+  const inventoryParser = marketplace === "tiktok" ? parseTikTokInventory : marketplace === "lazada" ? parseLazadaInventory : parseInventory;
+  const marketplaceName = marketplace === "tiktok" ? "TikTok" : marketplace === "lazada" ? "Lazada" : "Shopee";
+
+  return (
+    <div style={S.root}>
+      {/* ── Header ── */}
+      <header style={S.header}>
+        <div style={S.logo}>
+          <span style={{fontSize:24,color:"#f97316"}}>⬡</span>
+          <div>
+            <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9",letterSpacing:"-0.02em"}}>PriceSync</div>
+            <div style={{fontSize:10,color:"#475569",letterSpacing:"0.06em"}}>Marketplace Upload Converter</div>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          {mode && ["Upload","Configure","Preview","QC Check"].map((s,i) => (
+            <div key={i} style={{display:"flex",alignItems:"center",gap:6}}>
+              <div style={{...S.dot, background: step>i+1?"#f97316":step===i+1?"#f97316":"#1e293b", color:step>=i+1?"#fff":"#475569", opacity:step>i+1?0.5:1}}>
+                {step>i+1?"✓":i+1}
+              </div>
+              <span style={{color:step===i+1?"#f1f5f9":"#334155",fontSize:11,fontWeight:step===i+1?600:400}}>{s}</span>
+              {i<3 && <span style={{color:"#1e293b",margin:"0 2px"}}>›</span>}
+            </div>
+          ))}
+          {mode && (
+            <div style={{marginLeft:12,padding:"3px 10px",background:mode==="live"?"rgba(129,140,248,0.12)":"rgba(249,115,22,0.1)",border:`1px solid ${mode==="live"?"rgba(129,140,248,0.35)":"rgba(249,115,22,0.35)"}`,borderRadius:20,fontSize:10,fontWeight:700,color:mode==="live"?"#818cf8":"#f97316",letterSpacing:"0.08em"}}>
+              {mode==="live"?"✦ LIVE PROMO":"🏷 DISCOUNT PROMO"}
+            </div>
+          )}
+        </div>
+      </header>
+
+      <main style={S.main}>
+
+        {/* ═══ MODE SELECTION ═══ */}
+        {marketplace === null && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>SELECT MARKETPLACE</div>
+            <h2 style={S.h2}>Which marketplace are you preparing?</h2>
+            <p style={S.desc}>Choose the marketplace first so PriceSync can read the right inventory format and create the right upload file.</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginTop:8}}>
+              <ModeCard
+                icon="S"
+                title="Shopee"
+                color="#f97316"
+                pills={["Discount","Live Promo","Existing Flow"]}
+                bullets={["Uses Shopee inventory report","Exports Shopee upload template","Keeps current functionality"]}
+                onClick={() => { setMarketplace("shopee"); setMode(null); setStep(1); }}
+              />
+              <ModeCard
+                icon="T"
+                title="TikTok"
+                color="#60a5fa"
+                pills={["Discount","SKU Penjual","New Flow"]}
+                bullets={["Uses TikTok Template sheet","Joins with memo by SKU Penjual","Exports Product ID, SKU ID, offer price"]}
+                onClick={() => { setMarketplace("tiktok"); setMode(null); setStep(1); }}
+              />
+              <ModeCard
+                icon="L"
+                title="Lazada"
+                color="#0f9549"
+                pills={["Discount","Special Price","Date Range"]}
+                bullets={["Uses Lazada inventory template","Joins on Seller SKU (col M)","Exports Seller SKU, RRP, Sale Amount + Dates"]}
+                onClick={() => { setMarketplace("lazada"); setMode(null); setStep(1); }}
+              />
+            </div>
+          </div>
+        )}
+
+        {marketplace !== null && mode === null && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>SELECT WORKFLOW</div>
+            <h2 style={S.h2}>What type of {marketplaceName} promotion are you preparing?</h2>
+            <p style={S.desc}>Choose your workflow. Each uses a different source sheet and configuration from the memo pricelist.</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginTop:8}}>
+              <ModeCard
+                icon="🏷️"
+                title="Discount Promotion"
+                color="#f97316"
+                pills={["6.6 SALE","BAU","Payday","Flash Sale"]}
+                bullets={["Uses monthly sheet (JUNE, etc.)","Campaign price from Promo Live columns","RRP comparison included","No period selection needed"]}
+                onClick={() => { setMode("discount"); setStep(1); }}
+              />
+              <ModeCard
+                icon="🎥"
+                title="Live Promotion"
+                color="#818cf8"
+                pills={[`${marketplaceName} Live`,"Studio Session","Date Slots"]}
+                bullets={["Uses LIVE sheet from memo","Select a specific live date & time","Items filtered by YES/NO in period column","Full period exclusion logic"]}
+                onClick={() => { setMode("live"); setStep(1); }}
+              />
+            </div>
+            <button style={{...S.backBtn,marginTop:18,paddingLeft:0}} onClick={() => setMarketplace(null)}>Change marketplace</button>
+          </div>
+        )}
+
+        {/* ═══ STEP 1: Upload ═══ */}
+        {marketplace !== null && mode !== null && step === 1 && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>STEP 1</div>
+            <h2 style={S.h2}>Upload Source Files</h2>
+            <p style={S.desc}>Upload both files. The app will auto-detect columns and join them on <strong style={{color:"#f97316"}}>SKU code</strong>.</p>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 60px 1fr",gap:16,marginBottom:20}}>
+              <DropBox
+                title="Inventory Report"
+                sub={`Downloaded from ${marketplaceName} seller center`}
+                icon="🏪"
+                accent="#f97316"
+                fileName={invFile}
+                rows={inventory?.totalRows}
+                chips={inventory ? (marketplace === "tiktok" ? ["Product ID ✓","SKU ID ✓","SKU Penjual ✓","Price ✓"] : marketplace === "lazada" ? ["Product ID ✓","Seller SKU ✓","Jumlah Stok ✓","Harga ✓"] : ["Product ID ✓","SKU ✓","Stock ✓","Price ✓"]) : []}
+                active={dragOver==="inv"}
+                onDrag={v => setDragOver(v?"inv":null)}
+                onDrop={f => loadFile(f, inventoryParser, setInventory, setInvFile)}
+                onReplace={() => invRef.current?.click()}
+              />
+              <input ref={invRef} type="file" accept=".xlsx" style={{display:"none"}} onChange={e => loadFile(e.target.files[0], inventoryParser, setInventory, setInvFile)} />
+
+              {/* Arrow divider */}
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6}}>
+                <div style={{flex:1,width:1,background:"#1e293b"}}/>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:16,marginBottom:4}}>🔗</div>
+                  <div style={{fontSize:9,color:"#334155",letterSpacing:"0.08em",lineHeight:1.4}}>JOIN ON<br/>SKU CODE</div>
+                </div>
+                <div style={{flex:1,width:1,background:"#1e293b"}}/>
+              </div>
+
+              <DropBox
+                title="Memo Pricelist"
+                sub="Client file with campaign prices"
+                icon="📋"
+                accent="#60a5fa"
+                fileName={memoFile}
+                rows={memo?.totalRows}
+                chips={memo ? [`Sheet: ${memo.sheetName}`, `${memo.promoCols.length} price cols`, ...(memo.isLiveSheet?[`${memo.periodCols.length} periods`]:[]), ...(memo.isLiveSheet?["LIVE ✦"]:[])] : []}
+                active={dragOver==="memo"}
+                onDrag={v => setDragOver(v?"memo":null)}
+                onDrop={f => loadMemo(f, mode)}
+                onReplace={() => memoRef.current?.click()}
+              />
+              <input ref={memoRef} type="file" accept=".xlsx" style={{display:"none"}} onChange={e => loadMemo(e.target.files[0], mode)} />
+            </div>
+
+            {canConfigure && (
+              <div style={S.successBox}>
+                <span style={{color:"#4ade80",fontSize:16}}>✓</span>
+                <span>Both files loaded — <strong style={{color:"#f1f5f9"}}>{inventory.totalRows.toLocaleString()}</strong> inventory SKUs will be matched against <strong style={{color:"#f1f5f9"}}>{memo.totalRows.toLocaleString()}</strong> memo items.</span>
+              </div>
+            )}
+
+            <div style={{display:"flex",justifyContent:"flex-end",marginTop:24}}>
+              <button
+                style={{...S.primaryBtn, opacity:canConfigure?1:0.3, cursor:canConfigure?"pointer":"not-allowed"}}
+                disabled={!canConfigure}
+                onClick={() => setStep(2)}
+              >Configure →</button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 2: Configure ═══ */}
+        {marketplace !== null && mode !== null && step === 2 && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>STEP 2</div>
+            <h2 style={S.h2}>Select Promo Column & Rounding</h2>
+            <p style={S.desc}>
+              Choose which price column from the memo to use as the discount price.
+              Columns are shown exactly as they appear in the file.
+            </p>
+
+            {/* Sheet selector */}
+            <div style={S.sectionLabel}>SOURCE SHEET  <span style={{color:"#334155",fontWeight:400}}>— from {memoFile}</span></div>
+            <div style={{display:"flex",gap:8,marginBottom:24,flexWrap:"wrap"}}>
+              {availableSheets.filter(s => {
+                if (mode === "live")     return /live/i.test(s);
+                if (mode === "discount") return !/live/i.test(s);
+                return true;
+              }).map(s => (
+                <button key={s}
+                  style={{padding:"8px 14px",border:`1px solid ${selectedMemoSheet===s?"#f97316":"#1e293b"}`,borderRadius:8,background:selectedMemoSheet===s?"rgba(249,115,22,0.1)":"#080e1a",color:selectedMemoSheet===s?"#f1f5f9":"#64748b",fontSize:12,fontWeight:selectedMemoSheet===s?700:400,cursor:"pointer",transition:"all 0.15s",display:"flex",alignItems:"center",gap:6}}
+                  onClick={() => switchMemoSheet(s)}>
+                  {/live/i.test(s) && <span style={{fontSize:10,color:"#fb923c"}}>✦</span>}
+                  {s}
+                  {selectedMemoSheet===s && <span style={{color:"#f97316",fontSize:11}}>✓</span>}
+                </button>
+              ))}
+            </div>
+
+            {/* Period selector — LIVE sheets only */}
+            {mode === 'live' && memo?.isLiveSheet && (
+              <>
+                <div style={S.sectionLabel}>LIVE PERIOD  <span style={{color:"#334155",fontWeight:400}}>— select which session to include</span></div>
+                <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:24}}>
+                  {memo.periodCols.map(col => (
+                    <button key={col.colIndex}
+                      style={{...S.promoRow,...(selPeriodCol?.colIndex===col.colIndex?{border:"1px solid #fb923c",background:"rgba(251,146,60,0.08)"}:{})}}
+                      onClick={() => setSelPeriodCol(col)}>
+                      <div style={{...S.colBadge,background:selPeriodCol?.colIndex===col.colIndex?"rgba(251,146,60,0.15)":"#1e293b",color:"#fb923c"}}>{col.colLetter}</div>
+                      <div style={{flex:1,textAlign:"left"}}>
+                        <div style={{fontSize:13,fontWeight:600,color:selPeriodCol?.colIndex===col.colIndex?"#f1f5f9":"#94a3b8"}}>{col.shortLabel}</div>
+                        <div style={{fontSize:10,color:"#475569",marginTop:1}}>{col.includedCount} items marked YES</div>
+                      </div>
+                      {selPeriodCol?.colIndex===col.colIndex && <span style={{color:"#fb923c",fontSize:14}}>✓</span>}
+                    </button>
+                  ))}
+                  {memo.periodCols.length === 0 && (
+                    <div style={S.warnBox}>No period columns detected (col M onwards). Make sure the sheet has YES/NO date columns.</div>
+                  )}
+                </div>
+              </>
+            )}
+
+            {/* Promo column selector */}
+            <div style={S.sectionLabel}>PROMOTION COLUMN  <span style={{color:"#334155",fontWeight:400}}>— from {memoFile}</span></div>
+            {memo?.promoCols.length === 0 && (
+              <div style={{...S.warnBox, marginBottom:16}}>No price columns were auto-detected. Make sure the memo file has numeric price columns (e.g. "6.6 SALE", "BAU", "PAYDAY").</div>
+            )}
+            <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:28}}>
+              {memo?.promoCols.map(col => (
+                <button key={col.colIndex}
+                  style={{...S.promoRow, ...(selPromoCol?.colIndex===col.colIndex ? S.promoRowActive : {})}}
+                  onClick={() => setSelPromoCol(col)}>
+                  <div style={S.colBadge}>{col.colLetter}</div>
+                  <div style={{flex:1,textAlign:"left"}}>
+                    <div style={{fontSize:13,fontWeight:600,color: selPromoCol?.colIndex===col.colIndex?"#f1f5f9":"#94a3b8"}}>{col.headerLabel}</div>
+                    {col.categoryLabel && col.categoryLabel !== col.headerLabel &&
+                      <div style={{fontSize:11,color:"#475569",marginTop:1}}>{col.categoryLabel}</div>}
+                  </div>
+                  {selPromoCol?.colIndex===col.colIndex && <span style={{color:"#f97316",fontSize:14}}>✓</span>}
+                </button>
+              ))}
+            </div>
+
+            <div style={S.hintBox}>
+              <span style={{color:"#f97316"}}>📐 Round-up:</span> All discount prices are rounded up to the nearest whole number — same as Excel's <code style={{background:"#0f172a",padding:"1px 5px",borderRadius:3,fontSize:11}}>ROUNDUP(price, 0)</code>. Decimals from percentage calculations are always rounded up.
+            </div>
+
+            {marketplace === "lazada" && (
+              <div style={{marginTop:20}}>
+                <div style={S.sectionLabel}>LAZADA PROMO DATES (WIB) <span style={{color:"#334155",fontWeight:400}}>— written into the upload template</span></div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:8}}>
+                  <div>
+                    <div style={{fontSize:11,color:"#64748b",marginBottom:6}}>Sale Start Date</div>
+                    <input type="datetime-local"
+                      value={lazadaStartDate ? lazadaStartDate.slice(0,16) : ""}
+                      onChange={e => setLazadaStartDate(e.target.value + ":00")}
+                      style={{width:"100%",background:"#080e1a",border:"1px solid #1e293b",borderRadius:8,padding:"9px 12px",color:"#e2e8f0",fontSize:12,outline:"none"}}
+                    />
+                  </div>
+                  <div>
+                    <div style={{fontSize:11,color:"#64748b",marginBottom:6}}>Sale End Date</div>
+                    <input type="datetime-local"
+                      value={lazadaEndDate ? lazadaEndDate.slice(0,16) : ""}
+                      onChange={e => setLazadaEndDate(e.target.value + ":00")}
+                      style={{width:"100%",background:"#080e1a",border:"1px solid #1e293b",borderRadius:8,padding:"9px 12px",color:"#e2e8f0",fontSize:12,outline:"none"}}
+                    />
+                  </div>
+                </div>
+                <div style={{fontSize:11,color:"#475569"}}>Optional — leave blank to fill in manually. Output format: YYYY-MM-DD HH:MM:SS</div>
+              </div>
+            )}
+
+            <div style={S.actionRow}>
+              <button style={S.backBtn} onClick={() => setStep(1)}>← Back</button>
+              <button
+                style={{...S.primaryBtn, opacity:(selPromoCol && (mode !== 'live' || selPeriodCol))?1:0.3, cursor:(selPromoCol && (mode !== 'live' || selPeriodCol))?"pointer":"not-allowed"}}
+                disabled={!selPromoCol || (mode === 'live' && !selPeriodCol)}
+                onClick={generate}
+              >Generate Preview →</button>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 3: Preview ═══ */}
+        {marketplace !== null && mode !== null && step === 3 && stats && (
+          <div style={S.card}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+              <div style={S.cardLabel}>STEP 3</div>
+              <div style={S.fileBadge}>
+                <span style={{color:"#f97316",fontWeight:600}}>Col {selPromoCol?.colLetter}</span>
+                <span style={{color:"#334155",margin:"0 6px"}}>·</span>
+                <span style={{color:"#94a3b8"}}>{selPromoCol?.headerLabel}</span>
+                <span style={{color:"#334155",margin:"0 6px"}}>·</span>
+                <span style={{color:"#c084fc"}}>ROUNDUP(,0)</span>
+              </div>
+            </div>
+            <h2 style={S.h2}>QC Preview & Export</h2>
+
+            {/* Stats */}
+            <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+              <StatCard label="Total Rows"     value={stats.total}       color="#60a5fa" />
+              <StatCard label="→ Export"       value={stats.exported}    color="#4ade80" />
+              <StatCard label="Zero Stock ⊘"   value={stats.zeroStock}   color="#64748b" />
+              <StatCard label="Unmatched"      value={stats.unmatched}   color="#f87171" />
+              <StatCard label="RRP Mismatch"   value={stats.rrpMismatch} color="#fb923c" />
+              {stats.notInPeriod > 0 && <StatCard label="Not in Period" value={stats.notInPeriod} color="#818cf8" />}
+              <StatCard label="Warnings"       value={stats.warnings}    color="#facc15" />
+            </div>
+
+            {/* Export toggles */}
+            <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+              <span style={{fontSize:10,color:"#334155",letterSpacing:"0.1em",fontWeight:700}}>EXPORT TOGGLES</span>
+              <ToggleBtn on={inclZero} onLabel="Zero Stock: INCLUDED" offLabel="Zero Stock: EXCLUDED" onColor="#4ade80" offColor="#64748b" onClick={()=>setInclZero(v=>!v)} />
+              <ToggleBtn on={!exclRRP} onLabel="RRP Mismatch: INCLUDED" offLabel="RRP Mismatch: EXCLUDED" onColor="#fb923c" offColor="#64748b" onClick={()=>setExclRRP(v=>!v)} />
+              <ToggleBtn on={!exclZeroDisc} onLabel="0% Discount: INCLUDED" offLabel="0% Discount: EXCLUDED" onColor="#60a5fa" offColor="#64748b" onClick={()=>setExclZeroDisc(v=>!v)} />
+            </div>
+
+            {/* Match rate */}
+            <div style={{marginBottom:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"#64748b",marginBottom:4}}>
+                <span>Memo match rate</span>
+                <span style={{color:stats.unmatched===0?"#4ade80":"#facc15"}}>{(stats.total-stats.unmatched).toLocaleString()} / {stats.total.toLocaleString()} ({Math.round((stats.total-stats.unmatched)/stats.total*100)}%)</span>
+              </div>
+              <div style={{height:4,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${(stats.total-stats.unmatched)/stats.total*100}%`,background:"linear-gradient(90deg,#f97316,#fb923c)",borderRadius:3}}/>
+              </div>
+            </div>
+
+            {/* Filter tabs */}
+            <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>
+              {[["all",`All (${stats.total})`],["export",`Will Export (${stats.exported})`],["rrpmismatch",`RRP Mismatch (${stats.rrpMismatch})`],["zerostock",`Zero Stock (${stats.zeroStock})`],["zerodiscount",`0% Discount (${stats.zeroDiscount})`],["unmatched",`Unmatched (${stats.unmatched})`],["warnings",`Warnings (${stats.warnings})`],...(stats.notInPeriod>0?[["notinperiod",`Not in Period (${stats.notInPeriod})`]]:[] )].map(([k,v])=>(
+                <button key={k} style={{...S.filterBtn,...(filterQC===k?S.filterActive:{})}} onClick={()=>setFilterQC(k)}>{v}</button>
+              ))}
+            </div>
+
+            {/* Table */}
+            <div style={S.tableWrap}>
+              <table style={S.table}>
+                <thead><tr>
+                  {["SKU","Product Name","Stock","RRP (Memo P)","MP Price (Inv G)","RRP Match","Disc Price","Status"].map(h=>(
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {filtered.slice(0,300).map((r,i)=>{
+                    const exp = isExported(r,inclZero,exclRRP,exclZeroDisc);
+                    return (
+                    <tr key={i} style={{background:!exp?"rgba(0,0,0,0.25)":i%2===0?"transparent":"rgba(255,255,255,0.012)",opacity:!exp?0.5:1}}>
+                      <td style={{...S.td,fontFamily:"monospace",fontSize:11,color:r.memoFound?"#a3e635":"#f87171"}}>{r.sku}</td>
+                      <td style={{...S.td,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontSize:11,color:"#94a3b8"}}>{r.productName||"—"}</td>
+                      <td style={{...S.td,textAlign:"center",fontFamily:"monospace"}}><span style={{color:r.stock===0?"#f87171":"#4ade80",fontWeight:600}}>{r.stock}</span></td>
+                      <td style={{...S.td,textAlign:"right",fontSize:11,color:"#94a3b8"}}>{r.memoRRP!=null?`Rp ${fmtIDR(r.memoRRP)}`:"—"}</td>
+                      <td style={{...S.td,textAlign:"right",fontSize:11,color:"#94a3b8"}}>{r.invPrice!=null?`Rp ${fmtIDR(r.invPrice)}`:"—"}</td>
+                      <td style={{...S.td,textAlign:"center"}}>
+                        {r.memoRRP!=null&&r.invPrice!=null
+                          ? r.rrpMismatch
+                            ? <div><Badge type="orange">MISMATCH</Badge><div style={{fontSize:9,color:"#64748b",marginTop:1}}>{r.rrpDiff>0?"+":""}{fmtIDR(r.rrpDiff)}</div></div>
+                            : <Badge type="green">MATCH</Badge>
+                          : <span style={{color:"#334155",fontSize:10}}>—</span>}
+                      </td>
+                      <td style={{...S.td,textAlign:"right"}}>
+                        {r.disc!=null?<div>
+                          <div style={{fontWeight:600,color:"#f1f5f9",fontSize:12}}>Rp {fmtIDR(r.disc)}</div>
+                          {r.wasRounded&&<div style={{fontSize:9,color:"#475569"}}>↑ {fmtIDR(r.rawDisc)}</div>}
+                          {r.discPct!=null&&<div style={{fontSize:9,color:"#64748b"}}>{r.discPct}% off</div>}
+                        </div>:<span style={{color:"#475569"}}>—</span>}
+                      </td>
+                      <td style={S.td}>
+                        {r.isZeroStock&&<Badge type="gray">Zero Stock</Badge>}
+                        {r.rrpMismatch&&<Badge type="orange">RRP Mismatch</Badge>}
+                        {r.flags.filter(f=>f.type==="error").map((f,fi)=><Badge key={fi} type="red">{f.msg}</Badge>)}
+                        {r.flags.filter(f=>f.type==="warn").map((f,fi)=><Badge key={fi} type="yellow">{f.msg}</Badge>)}
+                        {r.discPct===0&&<Badge type="blue">No Discount</Badge>}
+                        {r.excludedByPeriod&&<Badge type="indigo">Not in Period</Badge>}
+                        {!r.isZeroStock&&!r.rrpMismatch&&!r.excludedByPeriod&&r.flags.filter(f=>f.type!=="skip"&&f.type!=="rrp"&&f.type!=="period").length===0&&<Badge type="green">Ready</Badge>}
+                      </td>
+                    </tr>);
+                  })}
+                </tbody>
+              </table>
+              {filtered.length>300&&<div style={{textAlign:"center",padding:10,color:"#475569",fontSize:11}}>Showing 300 of {filtered.length} rows</div>}
+              {filtered.length===0&&<div style={{textAlign:"center",padding:36,color:"#334155"}}>No rows match this filter.</div>}
+            </div>
+
+            {stats.rrpMismatch>0&&<div style={{background:"rgba(251,146,60,0.07)",border:"1px solid rgba(251,146,60,0.25)",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#fed7aa",marginBottom:8}}>
+              🔶 <strong>{stats.rrpMismatch} SKU{stats.rrpMismatch>1?"s":""}</strong> — memo RRP (col P) ≠ marketplace price (col G). Toggle <em>RRP Mismatch: EXCLUDED</em> above to remove from export.
+            </div>}
+            {stats.notInPeriod>0&&<div style={{background:"rgba(129,140,248,0.07)",border:"1px solid rgba(129,140,248,0.25)",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#c7d2fe",marginBottom:8}}>
+              🗓 <strong>{stats.notInPeriod} SKU{stats.notInPeriod>1?"s":""}</strong> marked <strong>NO</strong> (or blank) in the selected live period — excluded from export.
+            </div>}
+            {stats.zeroStock>0&&<div style={{...S.alertBox,borderColor:"rgba(100,116,139,0.3)",background:"rgba(100,116,139,0.08)",color:"#94a3b8",marginBottom:8}}>
+              ⊘ <strong>{stats.zeroStock} zero-stock SKU{stats.zeroStock>1?"s":""}</strong> — currently <strong>{inclZero?"INCLUDED":"EXCLUDED"}</strong>.
+            </div>}
+            {stats.zeroDiscount>0&&<div style={{...S.alertBox,borderColor:"rgba(96,165,250,0.3)",background:"rgba(96,165,250,0.08)",color:"#bfdbfe",marginBottom:8}}>
+              0% <strong>{stats.zeroDiscount} SKU{stats.zeroDiscount>1?"s":""}</strong> have no discount — currently <strong>{exclZeroDisc?"EXCLUDED":"INCLUDED"}</strong>.
+            </div>}
+            {stats.unmatched>0&&<div style={{...S.alertBox,marginBottom:8}}>
+              ⚠️ <strong>{stats.unmatched} SKU{stats.unmatched>1?"s":""}</strong> not found in memo.
+            </div>}
+
+            <div style={S.actionRow}>
+              <button style={S.backBtn} onClick={()=>setStep(2)}>← Back</button>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"flex-end"}}>
+                <button style={S.secondaryBtn} onClick={resetAll}>Start Over</button>
+                <button style={{...S.secondaryBtn,color:"#c084fc",borderColor:"rgba(192,132,252,0.35)"}} onClick={downloadWorkingFile}>📊 Working File</button>
+                <button style={S.secondaryBtn} onClick={download}>⬇ Upload File ({stats.exported.toLocaleString()})</button>
+                <button style={S.primaryBtn} onClick={()=>setStep(4)}>Final QC Check →</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ═══ STEP 4: QC Check ═══ */}
+        {marketplace !== null && mode !== null && step === 4 && stats && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>STEP 4 — FINAL QC</div>
+            <h2 style={S.h2}>QC: Source vs Output Comparison</h2>
+            <p style={S.desc}>Row-by-row comparison of every SKU — source data (inventory + memo) against what goes into the upload file. Verify each price, RRP, and status before submitting.</p>
+
+            {/* QC Summary cards */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+              <QCCard icon="✅" label="Will Export" value={stats.exported} sub={`of ${stats.total} total rows`} color="#4ade80" />
+              <QCCard icon="🔶" label="RRP Mismatch" value={stats.rrpMismatch} sub={exclRRP?"EXCLUDED from export":"Included (flagged)"} color="#fb923c" />
+              <QCCard icon="⊘" label="Zero Stock" value={stats.zeroStock} sub={inclZero?"Included in export":"EXCLUDED from export"} color="#64748b" />
+              <QCCard icon="0%" label="No Discount" value={stats.zeroDiscount} sub={exclZeroDisc?"EXCLUDED from export":"Included (flagged)"} color="#60a5fa" />
+              <QCCard icon="❌" label="No Memo Match" value={stats.unmatched} sub="SKU not found in memo" color="#f87171" />
+              <QCCard icon="⚠️" label="Other Warnings" value={stats.warnings} sub="Disc > orig, high discount" color="#facc15" />
+              <QCCard icon="🔢" label="Prices Rounded" value={stats.rounded} sub="=ROUNDUP(x,0) applied" color="#c084fc" />
+            </div>
+
+            {/* QC filter */}
+            <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>
+              {[["exported","Will Export"],["rrpmismatch","RRP Mismatch"],["excluded","Excluded"],["all","All Rows"]].map(([k,v])=>(
+                <button key={k} style={{...S.filterBtn,...(filterQC4===k?S.filterActive:{})}} onClick={()=>setFilterQC4(k)}>{v}</button>
+              ))}
+            </div>
+
+            {/* QC Table */}
+            <div style={S.tableWrap}>
+              <table style={S.table}>
+                <thead><tr>
+                  {["SKU","Product / Variation","Stock","Source: RRP (P)","Source: MP Price (G)","RRP Match","Source: Promo Price","→ Final Disc Price","Disc %","Exported?","Notes"].map(h=>(
+                    <th key={h} style={S.th}>{h}</th>
+                  ))}
+                </tr></thead>
+                <tbody>
+                  {merged.filter(r=>{
+                    const exp=isExported(r,inclZero,exclRRP,exclZeroDisc);
+                    if(filterQC4==="exported")   return exp;
+                    if(filterQC4==="excluded")   return !exp;
+                    if(filterQC4==="rrpmismatch")return r.rrpMismatch;
+                    return true;
+                  }).slice(0,400).map((r,i)=>{
+                    const exp=isExported(r,inclZero,exclRRP,exclZeroDisc);
+                    return (
+                    <tr key={i} style={{background:!exp?"rgba(0,0,0,0.3)":r.rrpMismatch?"rgba(251,146,60,0.04)":i%2===0?"transparent":"rgba(255,255,255,0.01)",opacity:!exp?0.55:1}}>
+                      <td style={{...S.td,fontFamily:"monospace",fontSize:10,color:r.memoFound?"#a3e635":"#f87171"}}>{r.sku}</td>
+                      <td style={{...S.td,fontSize:10}}>
+                        <div style={{color:"#e2e8f0",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.productName||"—"}</div>
+                        <div style={{color:"#475569",fontSize:9}}>{r.varName||""}</div>
+                      </td>
+                      <td style={{...S.td,textAlign:"center"}}><span style={{color:r.stock===0?"#f87171":"#4ade80",fontWeight:600,fontFamily:"monospace",fontSize:11}}>{r.stock}</span></td>
+                      <td style={{...S.td,textAlign:"right",fontSize:11,color:"#94a3b8"}}>{r.memoRRP!=null?`Rp ${fmtIDR(r.memoRRP)}`:<span style={{color:"#334155"}}>—</span>}</td>
+                      <td style={{...S.td,textAlign:"right",fontSize:11,color:"#94a3b8"}}>{r.invPrice!=null?`Rp ${fmtIDR(r.invPrice)}`:<span style={{color:"#334155"}}>—</span>}</td>
+                      <td style={{...S.td,textAlign:"center",fontSize:10}}>
+                        {r.memoRRP!=null&&r.invPrice!=null
+                          ?r.rrpMismatch?<div><span style={{color:"#fb923c",fontWeight:700}}>✗</span><div style={{fontSize:9,color:"#64748b"}}>{r.rrpDiff>0?"+":""}{fmtIDR(r.rrpDiff)}</div></div>
+                          :<span style={{color:"#4ade80",fontWeight:700}}>✓</span>
+                          :<span style={{color:"#334155"}}>—</span>}
+                      </td>
+                      <td style={{...S.td,textAlign:"right",fontSize:11,color:"#64748b"}}>{r.rawDisc!=null?`Rp ${fmtIDR(r.rawDisc)}`:<span style={{color:"#334155"}}>—</span>}</td>
+                      <td style={{...S.td,textAlign:"right"}}>
+                        {r.disc!=null?<div>
+                          <div style={{fontWeight:700,color:exp?"#f1f5f9":"#475569",fontSize:12}}>Rp {fmtIDR(r.disc)}</div>
+                          {r.wasRounded&&<div style={{fontSize:9,color:"#64748b"}}>↑ {fmtIDR(r.rawDisc)}</div>}
+                        </div>:<span style={{color:"#334155",fontSize:11}}>—</span>}
+                      </td>
+                      <td style={{...S.td,textAlign:"center",fontFamily:"monospace",fontSize:11,color:r.discPct!=null&&r.discPct<0?"#f87171":r.discPct>80?"#facc15":"#94a3b8"}}>
+                        {r.discPct!=null?`${r.discPct}%`:"—"}
+                      </td>
+                      <td style={{...S.td,textAlign:"center"}}>{exp?<Badge type="green">YES</Badge>:<Badge type="gray">NO</Badge>}</td>
+                      <td style={{...S.td,fontSize:10,color:"#475569",whiteSpace:"nowrap"}}>
+                        {r.isZeroStock&&<div>⊘ Zero stock</div>}
+                        {r.rrpMismatch&&<div style={{color:"#fb923c"}}>🔶 RRP mismatch</div>}
+                        {!r.memoFound&&<div style={{color:"#f87171"}}>❌ Not in memo</div>}
+                        {r.flags.filter(f=>f.type==="warn").map((f,fi)=><div key={fi} style={{color:"#facc15"}}>⚠ {f.msg}</div>)}
+                        {r.discPct===0&&<div style={{color:"#60a5fa"}}>0% No discount</div>}
+                        {exp&&!r.isZeroStock&&!r.rrpMismatch&&r.flags.filter(f=>f.type!=="skip"&&f.type!=="rrp"&&f.type!=="info").length===0&&<div style={{color:"#4ade80"}}>✓ OK</div>}
+                      </td>
+                    </tr>);
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={S.actionRow}>
+              <button style={S.backBtn} onClick={()=>setStep(3)}>← Back to Preview</button>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"flex-end"}}>
+                <button style={S.secondaryBtn} onClick={resetAll}>Start Over</button>
+                <button style={{...S.secondaryBtn,color:"#c084fc",borderColor:"rgba(192,132,252,0.35)"}} onClick={downloadWorkingFile}>📊 Working File</button>
+                <button style={S.primaryBtn} onClick={download}>⬇ Download Upload File ({stats.exported.toLocaleString()} SKUs)</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <footer style={{padding:"12px 32px",borderTop:"1px solid #0f172a",fontSize:10,color:"#1e293b",textAlign:"center",letterSpacing:"0.06em"}}>
+        PriceSync v6.0 · Shopee · TikTok · Lazada · Discount & Live Promotion
+      </footer>
+    </div>
+  );
+}
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
+
+function DropBox({ title, sub, icon, accent, fileName, rows, chips, active, onDrag, onDrop, onReplace }) {
+  return (
+    <div
+      style={{border:`1px dashed ${active?accent:fileName?"#22c55e":"#1e293b"}`,borderRadius:12,padding:"22px 18px",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:170,textAlign:"center",background:active?`${accent}08`:fileName?"rgba(34,197,94,0.03)":"#0a1120",cursor:fileName?"default":"pointer",transition:"all 0.18s"}}
+      onDragOver={e=>{e.preventDefault();onDrag(true);}}
+      onDragLeave={()=>onDrag(false)}
+      onDrop={e=>{e.preventDefault();onDrag(false);onDrop(e.dataTransfer.files[0]);}}
+      onClick={!fileName?()=>onDrop(null):undefined}
+    >
+      {!fileName ? (
+        <>
+          <div style={{fontSize:28,marginBottom:8}}>{icon}</div>
+          <div style={{fontSize:11,fontWeight:700,color:accent,letterSpacing:"0.08em",marginBottom:3}}>{title}</div>
+          <div style={{fontSize:11,color:"#475569",marginBottom:14}}>{sub}</div>
+          <div style={{padding:"6px 16px",border:`1px solid ${accent}`,borderRadius:6,fontSize:11,color:accent,fontWeight:600}}>Drop or click to browse</div>
+        </>
+      ) : (
+        <div style={{width:"100%",textAlign:"left"}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+            <span style={{color:"#22c55e",fontSize:18,flexShrink:0}}>✓</span>
+            <div>
+              <div style={{fontSize:12,fontWeight:600,color:"#f1f5f9",lineHeight:1.3}}>{fileName}</div>
+              <div style={{fontSize:11,color:"#64748b"}}>{rows?.toLocaleString()} rows</div>
+            </div>
+          </div>
+          {chips.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:10}}>{chips.map(c=><span key={c} style={{fontSize:9,padding:"2px 7px",background:"rgba(34,197,94,0.1)",color:"#4ade80",borderRadius:3,fontWeight:600}}>{c}</span>)}</div>}
+          <button onClick={onReplace} style={{fontSize:11,color:"#475569",background:"transparent",border:"none",cursor:"pointer",padding:0,textDecoration:"underline"}}>Replace file</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModeCard({ icon, title, color, pills, bullets, onClick }) {
+  const [hov, setHov] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{textAlign:"left",padding:"24px",border:`1px solid ${hov?color+"66":"#1e293b"}`,borderRadius:14,background:hov?`${color}08`:"#080e1a",cursor:"pointer",transition:"all 0.2s",display:"flex",flexDirection:"column",gap:12}}
+    >
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:28}}>{icon}</span>
+        <div style={{fontSize:16,fontWeight:700,color:"#f1f5f9",letterSpacing:"-0.01em"}}>{title}</div>
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+        {pills.map(p=><span key={p} style={{fontSize:10,padding:"3px 9px",background:`${color}18`,color,borderRadius:20,fontWeight:600}}>{p}</span>)}
+      </div>
+      <ul style={{margin:0,padding:"0 0 0 16px",display:"flex",flexDirection:"column",gap:5}}>
+        {bullets.map(b=><li key={b} style={{fontSize:12,color:"#64748b",lineHeight:1.5}}>{b}</li>)}
+      </ul>
+      <div style={{marginTop:4,display:"flex",alignItems:"center",gap:6,color,fontSize:12,fontWeight:600}}>
+        Select <span style={{fontSize:14}}>→</span>
+      </div>
+    </button>
+  );
+}
+
+function StatCard({ label, value, color }) {
+  return (
+    <div style={{flex:"1 1 80px",minWidth:80,background:"#080e1a",border:"1px solid #1e293b",borderRadius:10,padding:"11px 13px"}}>
+      <div style={{fontSize:20,fontWeight:700,color,fontFamily:"monospace"}}>{value}</div>
+      <div style={{fontSize:9,color:"#475569",marginTop:2,letterSpacing:"0.06em",textTransform:"uppercase",lineHeight:1.3}}>{label}</div>
+    </div>
+  );
+}
+
+function Badge({ type, children }) {
+  const c = {
+    green: {bg:"rgba(74,222,128,0.1)",  t:"#4ade80"},
+    red:   {bg:"rgba(248,113,113,0.1)", t:"#f87171"},
+    yellow:{bg:"rgba(250,204,21,0.1)",  t:"#facc15"},
+    blue:  {bg:"rgba(96,165,250,0.1)",  t:"#60a5fa"},
+    gray:  {bg:"rgba(100,116,139,0.1)", t:"#64748b"},
+    orange:{bg:"rgba(251,146,60,0.12)", t:"#fb923c"},
+    indigo:{bg:"rgba(129,140,248,0.12)", t:"#818cf8"},
+  }[type]||{bg:"#1e293b",t:"#94a3b8"};
+  return <span style={{display:"inline-block",padding:"2px 7px",background:c.bg,color:c.t,borderRadius:4,fontSize:10,fontWeight:600,marginRight:3,marginBottom:2}}>{children}</span>;
+}
+
+function ToggleBtn({ on, onLabel, offLabel, onColor, offColor, onClick }) {
+  return (
+    <button onClick={onClick} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 12px",border:`1px solid ${on?onColor+"55":offColor+"44"}`,borderRadius:20,background:on?`${onColor}12`:"transparent",cursor:"pointer",transition:"all 0.2s"}}>
+      <div style={{width:10,height:10,borderRadius:"50%",background:on?onColor:offColor,flexShrink:0,transition:"all 0.2s"}}/>
+      <span style={{fontSize:11,fontWeight:600,color:on?onColor:offColor,whiteSpace:"nowrap"}}>{on?onLabel:offLabel}</span>
+    </button>
+  );
+}
+
+function QCCard({ icon, label, value, sub, color }) {
+  return (
+    <div style={{background:"#080e1a",border:"1px solid #1e293b",borderRadius:10,padding:"14px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+        <span style={{fontSize:16}}>{icon}</span>
+        <span style={{fontSize:10,color:"#475569",letterSpacing:"0.08em",textTransform:"uppercase",fontWeight:700}}>{label}</span>
+      </div>
+      <div style={{fontSize:24,fontWeight:700,color,fontFamily:"monospace",marginBottom:3}}>{value}</div>
+      <div style={{fontSize:10,color:"#334155"}}>{sub}</div>
+    </div>
+  );
+}
+
+// ─── Styles ──────────────────────────────────────────────────────────────────
+
+const S = {
+  root:      {minHeight:"100vh",background:"#060c18",color:"#e2e8f0",fontFamily:"'DM Sans','Segoe UI',sans-serif",display:"flex",flexDirection:"column"},
+  header:    {display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 28px",borderBottom:"1px solid #0f172a",background:"#080e1a",flexShrink:0},
+  logo:      {display:"flex",alignItems:"center",gap:10},
+  dot:       {width:20,height:20,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:700,flexShrink:0},
+  main:      {flex:1,display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"32px 16px"},
+  card:      {width:"100%",maxWidth:920,background:"#0c1628",border:"1px solid #1e293b",borderRadius:16,padding:"28px 32px"},
+  cardLabel: {fontSize:9,fontWeight:700,letterSpacing:"0.18em",color:"#f97316",marginBottom:5},
+  h2:        {fontSize:20,fontWeight:700,color:"#f1f5f9",margin:"0 0 8px",letterSpacing:"-0.02em"},
+  desc:      {fontSize:13,color:"#64748b",marginBottom:24,lineHeight:1.65},
+  sectionLabel:{fontSize:9,fontWeight:700,letterSpacing:"0.14em",color:"#334155",textTransform:"uppercase",marginBottom:10},
+  successBox:{background:"rgba(34,197,94,0.07)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#94a3b8",display:"flex",alignItems:"center",gap:8},
+  warnBox:   {background:"rgba(250,204,21,0.07)",border:"1px solid rgba(250,204,21,0.2)",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#fde68a"},
+  hintBox:   {background:"rgba(249,115,22,0.05)",border:"1px solid rgba(249,115,22,0.15)",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#94a3b8",lineHeight:1.6},
+  alertBox:  {background:"rgba(248,113,113,0.07)",border:"1px solid rgba(248,113,113,0.2)",borderRadius:8,padding:"10px 14px",fontSize:13,color:"#fca5a5",marginBottom:12},
+  promoRow:  {display:"flex",alignItems:"center",gap:12,padding:"10px 14px",border:"1px solid #1e293b",borderRadius:8,background:"#080e1a",cursor:"pointer",transition:"all 0.15s",width:"100%"},
+  promoRowActive:{border:"1px solid #f97316",background:"rgba(249,115,22,0.08)"},
+  colBadge:  {width:32,height:32,borderRadius:6,background:"#1e293b",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#f97316",fontFamily:"monospace",flexShrink:0},
+  roundupBtn:{flex:1,minWidth:90,padding:"9px 11px",border:"1px solid #1e293b",borderRadius:8,background:"#080e1a",cursor:"pointer",textAlign:"left",transition:"all 0.15s"},
+  roundupActive:{border:"1px solid #c084fc",background:"rgba(192,132,252,0.07)"},
+  fileBadge: {display:"flex",alignItems:"center",flexWrap:"wrap",fontSize:12,background:"#080e1a",border:"1px solid #1e293b",borderRadius:6,padding:"3px 10px"},
+  actionRow: {display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:22},
+  primaryBtn:{padding:"10px 22px",background:"#f97316",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:600,cursor:"pointer"},
+  secondaryBtn:{padding:"10px 20px",background:"transparent",color:"#64748b",border:"1px solid #1e293b",borderRadius:8,fontSize:13,fontWeight:600,cursor:"pointer"},
+  backBtn:   {padding:"10px 14px",background:"transparent",color:"#475569",border:"none",fontSize:13,cursor:"pointer"},
+  tableWrap: {border:"1px solid #1e293b",borderRadius:10,overflow:"auto",maxHeight:360,marginBottom:14},
+  table:     {width:"100%",borderCollapse:"collapse",fontSize:12},
+  th:        {padding:"8px 11px",textAlign:"left",fontSize:9,fontWeight:700,letterSpacing:"0.08em",color:"#334155",textTransform:"uppercase",background:"#080e1a",borderBottom:"1px solid #1e293b",position:"sticky",top:0,zIndex:1,whiteSpace:"nowrap"},
+  td:        {padding:"8px 11px",borderBottom:"1px solid rgba(255,255,255,0.025)",color:"#e2e8f0",verticalAlign:"middle"},
+  filterBtn: {padding:"5px 11px",background:"transparent",color:"#475569",border:"1px solid #1e293b",borderRadius:6,fontSize:11,cursor:"pointer"},
+  filterActive:{background:"rgba(249,115,22,0.08)",color:"#f97316",border:"1px solid rgba(249,115,22,0.3)"},
+};
+
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<PriceSync />);
+  </script>
+</body>
+</html>
